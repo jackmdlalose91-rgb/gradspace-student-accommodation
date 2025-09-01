@@ -1,427 +1,434 @@
+import os
+import json
+import time
+import secrets
+import string
+from datetime import datetime, timedelta
+from email.message import EmailMessage
 
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
-import io
-import base64
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import numpy as np
+import bcrypt
+from email_validator import validate_email, EmailNotValidError
 
-st.set_page_config(page_title="Gradspace Manager", page_icon="🏠", layout="wide")
+# ---------- Constants & Paths ----------
+APP_TITLE = "🏠 Gradspace Student Accommodation Tracker"
+APP_SUBTITLE = "Gradspace Manager"
+USERS_FILE = "users.json"
+DATA_DIR = "data"
+UPLOADS_DIR = "uploads"
+RESET_FILE = os.path.join(DATA_DIR, "reset_tokens.json")
 
-# ------------------------------
-# Auth & Secrets
-# ------------------------------
-DEFAULT_USERS = {
-    "admin": {"password": "admin123", "role": "admin", "name": "Admin"},
-    "manager": {"password": "manager123", "role": "manager", "name": "Manager"},
-}
+# Ensure folders exist
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(UPLOADS_DIR, exist_ok=True)
 
-def get_users():
-    users = {}
-    try:
-        # Expected format in secrets: 
-        # [users]
-        # admin = "admin123|admin|Admin Name"
-        # manager = "manager123|manager|Manager Name"
-        for k, v in st.secrets["users"].items():
-            pwd, role, name = v.split("|")
-            users[k] = {"password": pwd, "role": role, "name": name}
-    except Exception:
-        users = DEFAULT_USERS
-    return users
-
-USERS = get_users()
-
-# ------------------------------
-# Session State
-# ------------------------------
-def init_state():
-    ss = st.session_state
-    ss.setdefault("auth", {"logged_in": False, "username": None, "role": None, "name": None})
-    ss.setdefault("students", [])   # list of dicts
-    ss.setdefault("maintenance", [])# list of dicts
-    ss.setdefault("staff", [])      # list of dicts
-    ss.setdefault("suites", ["Gradspace Suite 1", "Gradspace Suite 2"])
-    ss.setdefault("rooms", {})      # {suite: set(room_numbers)}
-    ss.setdefault("uploads", {})    # {upload_id: {"name":..., "bytes":...}}
-    ss.setdefault("invoices", [])
-
-init_state()
-
-# ------------------------------
-# Helpers
-# ------------------------------
-def money(n):
-    try:
-        return f"${float(n):,.2f}"
-    except Exception:
-        return str(n)
-
-def store_upload(file):
-    if not file:
-        return None
-    key = f"{datetime.utcnow().timestamp()}_{file.name}"
-    st.session_state["uploads"][key] = {
-        "name": file.name,
-        "bytes": file.getvalue(),
-        "mime": file.type,
+# ---------- PWA injection (manifest + service worker) ----------
+st.markdown(
+    """
+    <link rel="manifest" href="/manifest.json" />
+    <script>
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/service-worker.js').catch(console.error);
     }
-    return key
+    </script>
+    """,
+    unsafe_allow_html=True
+)
 
-def render_upload(key, width=150):
-    if not key:
-        return
-    item = st.session_state["uploads"].get(key)
-    if not item:
-        return
-    if item["mime"] and item["mime"].startswith("image/"):
-        st.image(item["bytes"], width=width)
-    else:
-        st.download_button("Download file", item["bytes"], file_name=item["name"])
+# ---------- Utility helpers ----------
+def load_json(path, default):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return default
+    return default
 
-def send_email_smtp(to_email, subject, body):
-    """
-    Optional email via SMTP if secrets are present.
-    Add to Secrets:
-      SMTP_SERVER="smtp.gmail.com"
-      SMTP_PORT=587
-      EMAIL_USER="you@example.com"
-      EMAIL_PASS="your-app-password"
-    """
+def save_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+def password_hash(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+def password_matches(pw: str, pw_hash: str) -> bool:
     try:
-        smtp_server = st.secrets["email"]["SMTP_SERVER"]
-        smtp_port = int(st.secrets["email"]["SMTP_PORT"])
-        email_user = st.secrets["email"]["EMAIL_USER"]
-        email_pass = st.secrets["email"]["EMAIL_PASS"]
+        return bcrypt.checkpw(pw.encode("utf-8"), pw_hash.encode("utf-8"))
     except Exception:
-        st.warning("Email secrets not configured. Skipping send.")
-        return False, "Email secrets missing"
+        return False
 
+def random_code(n=6):
+    return ''.join(secrets.choice(string.digits) for _ in range(n))
+
+def random_temp_pass(n=10):
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(n))
+
+def send_email_via_smtp(to_email: str, subject: str, body: str) -> bool:
+    """Send email using Streamlit Secrets if configured. Returns True if sent."""
     try:
-        msg = MIMEMultipart()
-        msg["From"] = email_user
+        email_secrets = st.secrets.get("email", {})
+        SMTP_SERVER = email_secrets.get("SMTP_SERVER", "smtp.gmail.com")
+        SMTP_PORT = int(email_secrets.get("SMTP_PORT", "587"))
+        EMAIL_USER = email_secrets.get("EMAIL_USER")
+        EMAIL_PASS = email_secrets.get("EMAIL_PASS")
+        if not EMAIL_USER or not EMAIL_PASS:
+            return False
+
+        import smtplib
+        msg = EmailMessage()
+        msg["From"] = EMAIL_USER
         msg["To"] = to_email
         msg["Subject"] = subject
-        msg.attach(MIMEText(body, "plain"))
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
+        msg.set_content(body)
+
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
-            server.login(email_user, email_pass)
+            server.login(EMAIL_USER, EMAIL_PASS)
             server.send_message(msg)
-        return True, "Email sent"
+        return True
     except Exception as e:
-        return False, str(e)
+        st.warning(f"Email send failed: {e}")
+        return False
 
-def whatsapp_link(phone_e164, message):
-    # phone should be in international format without "+" e.g., "64211234567"
-    from urllib.parse import quote
-    return f"https://wa.me/{phone_e164}?text={quote(message)}"
+# ---------- Load users & data ----------
+users = load_json(USERS_FILE, {})
+students = load_json(os.path.join(DATA_DIR, "students.json"), [])
+maintenance = load_json(os.path.join(DATA_DIR, "maintenance.json"), [])
+staff = load_json(os.path.join(DATA_DIR, "staff.json"), [])
+invoices = load_json(os.path.join(DATA_DIR, "invoices.json"), [])
+reset_tokens = load_json(RESET_FILE, {})  # {username: {"code": "...", "exp": "ISO", "temp": "pass"}}
 
-def mailto_link(email, subject, body):
-    from urllib.parse import quote
-    return f"mailto:{email}?subject={quote(subject)}&body={quote(body)}"
+# ---------- Header UI ----------
+st.markdown("<h1 style='text-align:center; color:#2E86C1;'>" + APP_TITLE + "</h1>", unsafe_allow_html=True)
+st.markdown("<h2 style='text-align:center; color:#117A65;'>" + APP_SUBTITLE + "</h2>", unsafe_allow_html=True)
+st.markdown("<hr style='margin:20px 0;'>", unsafe_allow_html=True)
 
-def invoice_text(student, amount, due_date):
-    lines = [
-        f"Invoice for {student.get('Name','')}",
-        f"Suite: {student.get('Suite','')} Room: {student.get('Room','')}",
-        f"Amount Due: {money(amount)}",
-        f"Due Date: {due_date.isoformat() if isinstance(due_date, date) else due_date}",
-        "",
-        "Thank you,",
-        "Gradspace Management"
-    ]
-    return "\n".join(lines)
+# ---------- Authentication ----------
+def show_login():
+    st.sidebar.header("🔑 Login")
+    username = st.sidebar.text_input("Username", key="login_user")
+    password = st.sidebar.text_input("Password", type="password", key="login_pass")
+    login_clicked = st.sidebar.button("Login", use_container_width=True)
 
-def download_df_button(df, filename="export.csv", label="⬇️ Download CSV"):
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(label, csv, filename, "text/csv")
-
-# ------------------------------
-# Auth UI
-# ------------------------------
-def login_ui():
-    st.markdown("### 🔐 Sign in")
-    with st.form("login"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submit = st.form_submit_button("Sign in")
-    if submit:
-        user = USERS.get(username)
-        if user and user["password"] == password:
-            st.session_state["auth"] = {
-                "logged_in": True,
-                "username": username,
-                "role": user["role"],
-                "name": user["name"],
-            }
-            st.success(f"Welcome {user['name']} ({user['role']})")
-            st.rerun()
-        else:
-            st.error("Invalid username or password")
-
-def topbar():
-    col1, col2, col3 = st.columns([6,2,2])
-    with col1:
-        st.markdown("## 🏠 Gradspace Manager")
-    with col2:
-        st.caption(f"Signed in as **{st.session_state['auth']['name']}** ({st.session_state['auth']['role']})")
-    with col3:
-        if st.button("Sign out", use_container_width=True):
-            st.session_state["auth"] = {"logged_in": False, "username": None, "role": None, "name": None}
-            st.rerun()
-
-# ------------------------------
-# Pages
-# ------------------------------
-def page_students():
-    st.markdown("### 👨‍🎓 Students")
-    with st.expander("➕ Add / Update Student", expanded=True):
-        with st.form("add_student"):
-            name = st.text_input("Student Name *")
-            suite = st.selectbox("Suite", st.session_state["suites"])
-            room = st.text_input("Room Number (no limit) *")
-            phone = st.text_input("Phone (for WhatsApp, use international without +)")
-            email = st.text_input("Email")
-            address = st.text_area("Home Address")
-            next_kin = st.text_input("Next of Kin Name")
-            kin_phone = st.text_input("Next of Kin Phone")
-            entry_date = st.date_input("Entry Date", value=date.today())
-            exit_date = st.date_input("Exit Date", value=date.today())
-            rent = st.number_input("Monthly Rent", min_value=0.0, step=50.0)
-            rent_paid = st.selectbox("Rent Paid", ["No", "Yes"])
-            profile_photo = st.file_uploader("Profile Photo (optional)", type=["png","jpg","jpeg"])
-            photo_key = store_upload(profile_photo) if profile_photo else None
-
-            electricity = st.number_input("Electricity Bill", min_value=0.0, step=10.0)
-            water = st.number_input("Water Bill", min_value=0.0, step=10.0)
-            internet = st.number_input("Internet Bill", min_value=0.0, step=10.0)
-            other = st.number_input("Other Utilities", min_value=0.0, step=10.0)
-
-            submitted = st.form_submit_button("Save Student")
-            if submitted:
-                if not name or not room:
-                    st.error("Name and Room are required")
-                else:
-                    total_due = (0 if rent_paid == "Yes" else rent) + electricity + water + internet + other
-                    rec = {
-                        "Name": name, "Suite": suite, "Room": room,
-                        "Phone": phone, "Email": email, "Address": address,
-                        "Next of Kin": next_kin, "Kin Phone": kin_phone,
-                        "Entry Date": entry_date, "Exit Date": exit_date,
-                        "Monthly Rent": rent, "Rent Paid": rent_paid,
-                        "Electricity": electricity, "Water": water, "Internet": internet, "Other": other,
-                        "Total Due": total_due, "Photo": photo_key,
-                    }
-                    # Replace if same (suite+room) exists, else add
-                    idx = None
-                    for i, s in enumerate(st.session_state["students"]):
-                        if s["Suite"] == suite and s["Room"] == room:
-                            idx = i; break
-                    if idx is not None:
-                        st.session_state["students"][idx] = rec
-                        st.success(f"Updated {name} in {suite} / {room}")
+    with st.sidebar.expander("Forgot password?"):
+        fp_user = st.text_input("Your username", key="fp_user")
+        fp_email = st.text_input("Registered email", key="fp_email")
+        if st.button("Send reset code", key="send_reset_code"):
+            if fp_user in users:
+                # validate email
+                user_email = users[fp_user].get("email", "")
+                try:
+                    validate_email(fp_email)
+                    if fp_email.strip().lower() != user_email.strip().lower():
+                        st.error("Email does not match our records.")
                     else:
-                        st.session_state["students"].append(rec)
-                        st.success(f"Added {name} to {suite} / {room}")
+                        code = random_code(6)
+                        temp_pass = random_temp_pass(10)
+                        exp = (datetime.utcnow() + timedelta(minutes=20)).isoformat()
+                        reset_tokens[fp_user] = {"code": code, "exp": exp, "temp": temp_pass}
+                        save_json(RESET_FILE, reset_tokens)
 
-    if st.session_state["students"]:
-        df = pd.DataFrame(st.session_state["students"])
+                        sent = send_email_via_smtp(
+                            to_email=fp_email,
+                            subject="Gradspace password reset",
+                            body=(
+                                f"Here is your password reset code: {code}\n\n"
+                                f"Temporary password: {temp_pass}\n"
+                                f"This code expires in 20 minutes.\n\n"
+                                f"Return to the app, open 'Forgot password?' → 'I have a reset code', "
+                                f"enter your code, and set a new password."
+                            )
+                        )
+                        if sent:
+                            st.success("Reset code sent to your email.")
+                        else:
+                            st.info("Email isn't configured; copy this code and temp password manually.")
+                            st.code(f"Code: {code}\nTemp password: {temp_pass}")
+                except EmailNotValidError as e:
+                    st.error(f"Invalid email: {e}")
+            else:
+                st.error("Unknown username.")
+
+        with st.expander("I have a reset code"):
+            rc_user = st.text_input("Username", key="rc_user")
+            rc_code = st.text_input("Reset code", key="rc_code")
+            new_pw = st.text_input("New password", type="password", key="rc_newpw")
+            if st.button("Confirm reset", key="rc_confirm"):
+                tok = reset_tokens.get(rc_user)
+                if not tok:
+                    st.error("No reset request found.")
+                else:
+                    try:
+                        if datetime.utcnow() > datetime.fromisoformat(tok["exp"]):
+                            st.error("Reset code expired.")
+                        elif rc_code.strip() != tok["code"]:
+                            st.error("Incorrect code.")
+                        else:
+                            # user must log in with temp password first OR we directly set
+                            users[rc_user]["password_hash"] = password_hash(new_pw)
+                            save_json(USERS_FILE, users)
+                            reset_tokens.pop(rc_user, None)
+                            save_json(RESET_FILE, reset_tokens)
+                            st.success("Password updated. You can now log in with your new password.")
+                    except Exception as e:
+                        st.error(f"Reset failed: {e}")
+
+    if login_clicked:
+        if username in users and password_matches(password, users[username]["password_hash"]):
+            st.session_state["auth"] = True
+            st.session_state["user"] = username
+            st.session_state["role"] = users[username].get("role", "student")
+            st.session_state["name"] = users[username].get("name", username)
+            st.experimental_rerun()
+        else:
+            st.error("❌ Invalid username or password")
+
+def ensure_auth():
+    if not st.session_state.get("auth"):
+        show_login()
+        st.stop()
+
+# ---------- Sidebar ----------
+if st.session_state.get("auth"):
+    st.sidebar.success(f"Signed in as {st.session_state.get('name')} ({st.session_state.get('role')})")
+    if st.sidebar.button("Sign out"):
+        for k in ["auth","user","role","name"]:
+            st.session_state.pop(k, None)
+        st.experimental_rerun()
+
+# ---------- Pages ----------
+def page_students():
+    st.subheader("👩🏽‍🎓 Students")
+    global students
+
+    with st.form("add_student"):
+        cols = st.columns(2)
+        with cols[0]:
+            name = st.text_input("Full name")
+            phone = st.text_input("Phone (WhatsApp)")
+            email = st.text_input("Email")
+            suite = st.text_input("Suite / Room")
+            rent = st.number_input("Rent", min_value=0.0, step=50.0)
+            utilities = st.number_input("Utilities", min_value=0.0, step=10.0)
+        with cols[1]:
+            kin = st.text_input("Next of kin")
+            kin_phone = st.text_input("Kin phone")
+            address = st.text_area("Home address")
+            photo = st.file_uploader("Profile photo", type=["png","jpg","jpeg"])
+        submitted = st.form_submit_button("Add / Update")
+        if submitted:
+            photo_path = ""
+            if photo:
+                photo_path = os.path.join(UPLOADS_DIR, f"student_{int(time.time())}_{photo.name}")
+                with open(photo_path, "wb") as f:
+                    f.write(photo.read())
+            student = {
+                "name": name, "phone": phone, "email": email,
+                "suite": suite, "rent": rent, "utilities": utilities,
+                "kin": kin, "kin_phone": kin_phone, "address": address,
+                "photo": photo_path, "created": datetime.utcnow().isoformat()
+            }
+            # upsert by name+suite
+            idx = next((i for i,s in enumerate(students) if s["name"]==name and s["suite"]==suite), None)
+            if idx is None:
+                students.append(student)
+            else:
+                students[idx] = student
+            save_json(os.path.join(DATA_DIR, "students.json"), students)
+            st.success("Student saved.")
+
+    if students:
+        df = pd.DataFrame(students)
         st.dataframe(df, use_container_width=True)
-        download_df_button(df, "students.csv", "⬇️ Download Students CSV")
-
-        st.markdown("#### Actions")
-        colA, colB, colC = st.columns(3)
-        with colA:
-            with st.form("delete_student"):
-                del_suite = st.selectbox("Suite", st.session_state["suites"], key="del_suite")
-                rooms = [s["Room"] for s in st.session_state["students"] if s["Suite"] == del_suite]
-                del_room = st.selectbox("Room", sorted(set(rooms)), key="del_room")
-                if st.form_submit_button("🗑️ Delete Student"):
-                    st.session_state["students"] = [s for s in st.session_state["students"] if not (s["Suite"] == del_suite and s["Room"] == del_room)]
-                    st.success("Student deleted")
-        with colB:
-            with st.form("invoice_student"):
-                inv_suite = st.selectbox("Suite", st.session_state["suites"], key="inv_suite")
-                rooms2 = [s["Room"] for s in st.session_state["students"] if s["Suite"] == inv_suite]
-                inv_room = st.selectbox("Room", sorted(set(rooms2)), key="inv_room")
-                due_date = st.date_input("Due date", value=date.today())
-                if st.form_submit_button("📄 Create Invoice"):
-                    stu = next((s for s in st.session_state["students"] if s["Suite"] == inv_suite and s["Room"] == inv_room), None)
-                    if stu:
-                        amount = stu.get("Total Due", 0.0)
-                        text = invoice_text(stu, amount, due_date)
-                        st.code(text)
-                        # WhatsApp & Email Links
-                        if stu.get("Phone"):
-                            st.link_button("Send via WhatsApp", whatsapp_link(stu["Phone"], text))
-                        if stu.get("Email"):
-                            st.link_button("Send via Email (open mail app)", mailto_link(stu["Email"], "Rent Invoice", text))
-                        st.session_state["invoices"].append({"Suite": inv_suite, "Room": inv_room, "Name": stu.get("Name",""), "Amount": amount, "Due": str(due_date), "Created": datetime.now().isoformat(timespec="seconds")})
-                        st.success("Invoice prepared")
-        with colC:
-            st.markdown("Upload Preview")
-            # Show selected student's photo
-            try:
-                sel = st.session_state.get("del_room") or st.session_state.get("inv_room")
-                if sel:
-                    stu = next((s for s in st.session_state["students"] if s["Room"] == sel), None)
-                    if stu and stu.get("Photo"):
-                        render_upload(stu["Photo"], width=180)
-            except Exception:
-                pass
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, "students.csv", "text/csv")
     else:
-        st.info("No students yet. Use the form above.")
+        st.info("No students yet.")
 
 def page_maintenance():
-    st.markdown("### 🛠️ Maintenance & Grounds")
-    with st.expander("➕ Log Maintenance Job", expanded=True):
-        with st.form("add_job"):
-            suite = st.selectbox("Suite", st.session_state["suites"], key="m_suite")
-            room = st.text_input("Room (optional)", key="m_room")
-            title = st.text_input("Job Title *")
+    st.subheader("🛠 Maintenance")
+    global maintenance
+
+    with st.form("add_job"):
+        cols = st.columns(2)
+        with cols[0]:
+            title = st.text_input("Job title")
             desc = st.text_area("Description")
-            worker = st.text_input("Assigned To / Worker")
-            cost = st.number_input("Cost", min_value=0.0, step=10.0)
-            status = st.selectbox("Status", ["Open", "In Progress", "Done"])
-            photo = st.file_uploader("Photo evidence (optional)", type=["png","jpg","jpeg"], key="m_photo")
-            photo_key = store_upload(photo) if photo else None
-            submit = st.form_submit_button("Save Job")
-            if submit:
-                if not title:
-                    st.error("Job Title is required")
-                else:
-                    st.session_state["maintenance"].append({
-                        "Suite": suite, "Room": room, "Title": title, "Desc": desc,
-                        "Worker": worker, "Cost": cost, "Status": status, "Photo": photo_key,
-                        "Logged": datetime.now().isoformat(timespec="seconds")
-                    })
-                    st.success("Job saved")
+            assignee = st.text_input("Assignee")
+        with cols[1]:
+            cost = st.number_input("Estimated cost", min_value=0.0, step=10.0)
+            status = st.selectbox("Status", ["Open","In Progress","Closed"])
+            evidence = st.file_uploader("Photo evidence", type=["png","jpg","jpeg"])
+        submitted = st.form_submit_button("Add job")
+        if submitted:
+            photo_path = ""
+            if evidence:
+                photo_path = os.path.join(UPLOADS_DIR, f"job_{int(time.time())}_{evidence.name}")
+                with open(photo_path, "wb") as f:
+                    f.write(evidence.read())
+            job = {
+                "title": title, "desc": desc, "assignee": assignee,
+                "cost": cost, "status": status, "photo": photo_path,
+                "created": datetime.utcnow().isoformat()
+            }
+            maintenance.append(job)
+            save_json(os.path.join(DATA_DIR, "maintenance.json"), maintenance)
+            st.success("Job added.")
 
-    if st.session_state["maintenance"]:
-        df = pd.DataFrame(st.session_state["maintenance"])
+    if maintenance:
+        df = pd.DataFrame(maintenance)
         st.dataframe(df, use_container_width=True)
-        download_df_button(df, "maintenance.csv", "⬇️ Download Jobs CSV")
-
-        # Delete
-        with st.form("del_job"):
-            idx = st.number_input("Delete by row index", min_value=0, max_value=len(st.session_state["maintenance"])-1, step=1)
-            if st.form_submit_button("🗑️ Delete Job"):
-                st.session_state["maintenance"].pop(int(idx))
-                st.success("Deleted job")
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, "maintenance.csv", "text/csv")
     else:
         st.info("No maintenance jobs yet.")
 
 def page_staff():
-    st.markdown("### 👷 Staff & Managers")
-    with st.expander("➕ Add Staff", expanded=True):
-        with st.form("add_staff"):
-            name = st.text_input("Name *", key="st_name")
-            role = st.selectbox("Role", ["manager", "maintenance", "grounds"])
+    st.subheader("👥 Staff")
+    global staff
+
+    with st.form("add_staff"):
+        cols = st.columns(3)
+        with cols[0]:
+            name = st.text_input("Name")
+        with cols[1]:
+            role = st.selectbox("Role", ["manager","maintenance","grounds","admin"])
+        with cols[2]:
             phone = st.text_input("Phone")
-            email = st.text_input("Email")
-            notes = st.text_area("Notes")
-            if st.form_submit_button("Save Staff"):
-                if not name:
-                    st.error("Name is required")
-                else:
-                    st.session_state["staff"].append({
-                        "Name": name, "Role": role, "Phone": phone, "Email": email, "Notes": notes
-                    })
-                    st.success("Staff saved")
+        email = st.text_input("Email")
+        submitted = st.form_submit_button("Add staff")
+        if submitted:
+            staff.append({"name":name,"role":role,"phone":phone,"email":email,"created":datetime.utcnow().isoformat()})
+            save_json(os.path.join(DATA_DIR, "staff.json"), staff)
+            st.success("Staff saved.")
 
-    if st.session_state["staff"]:
-        df = pd.DataFrame(st.session_state["staff"])
+    if staff:
+        df = pd.DataFrame(staff)
         st.dataframe(df, use_container_width=True)
-        download_df_button(df, "staff.csv", "⬇️ Download Staff CSV")
-
-        with st.form("del_staff"):
-            idx = st.number_input("Delete by row index", min_value=0, max_value=len(st.session_state["staff"])-1, step=1, key="st_del")
-            if st.form_submit_button("🗑️ Delete Staff"):
-                st.session_state["staff"].pop(int(idx))
-                st.success("Deleted staff")
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, "staff.csv", "text/csv")
     else:
         st.info("No staff yet.")
 
 def page_invoices():
-    st.markdown("### 💳 Invoices & Reminders")
-    if st.session_state["students"]:
-        with st.form("bulk_invoice"):
-            target_suite = st.selectbox("Suite (optional)", ["All"] + st.session_state["suites"])
-            due_date = st.date_input("Due date", value=date.today())
-            note = st.text_area("Note (optional)", value="Rent due")
-            if st.form_submit_button("Generate Invoices"):
-                targets = st.session_state["students"]
-                if target_suite != "All":
-                    targets = [s for s in targets if s["Suite"] == target_suite]
-                created = 0
-                for s in targets:
-                    amount = s.get("Total Due", 0.0)
-                    text = invoice_text(s, amount, due_date) + ("\n\n" + note if note else "")
-                    st.session_state["invoices"].append({
-                        "Suite": s["Suite"], "Room": s["Room"], "Name": s.get("Name",""),
-                        "Amount": amount, "Due": str(due_date),
-                        "Created": datetime.now().isoformat(timespec="seconds")
-                    })
-                    # Show links
-                    cols = st.columns([3,1,1])
-                    with cols[0]:
-                        st.code(text, language="text")
-                    with cols[1]:
-                        if s.get("Phone"):
-                            st.link_button("WhatsApp", whatsapp_link(s["Phone"], text))
-                    with cols[2]:
-                        if s.get("Email"):
-                            st.link_button("Email", mailto_link(s["Email"], "Rent Invoice", text))
-                    created += 1
-                st.success(f"Prepared {created} invoice(s)")
-    else:
-        st.info("Add students first.")
+    st.subheader("📄 Invoices")
+    global invoices, students
 
-    if st.session_state["invoices"]:
-        df = pd.DataFrame(st.session_state["invoices"])
+    with st.form("gen_invoice"):
+        cols = st.columns(2)
+        with cols[0]:
+            target = st.selectbox("Generate for", ["All students"] + [s["suite"] for s in students])
+        with cols[1]:
+            note = st.text_input("Note (e.g., September rent)")
+        submitted = st.form_submit_button("Generate")
+        if submitted:
+            targets = students if target=="All students" else [s for s in students if s["suite"]==target]
+            created = []
+            for s in targets:
+                amount = float(s.get("rent", 0)) + float(s.get("utilities", 0))
+                inv = {
+                    "student": s["name"], "suite": s["suite"], "amount": amount,
+                    "note": note, "email": s.get("email",""), "phone": s.get("phone",""),
+                    "created": datetime.utcnow().isoformat()
+                }
+                invoices.append(inv)
+                created.append(inv)
+            save_json(os.path.join(DATA_DIR, "invoices.json"), invoices)
+            st.success(f"Generated {len(created)} invoices.")
+
+    if invoices:
+        df = pd.DataFrame(invoices)
         st.dataframe(df, use_container_width=True)
-        download_df_button(df, "invoices.csv", "⬇️ Download Invoices CSV")
+
+        # Build WhatsApp/Email links for quick copy
+        st.markdown("#### Quick send links")
+        for inv in invoices[-20:][::-1]:
+            msg = f"Hello {inv['student']}, your invoice for {inv['note']} is {inv['amount']:.2f}."
+            wa = f"https://wa.me/{inv.get('phone','').replace('+','').replace(' ','')}?text=" + st.secrets.get("urlencode", lambda x:x)(msg) if False else f"https://wa.me/?text={msg}"
+            mailto = f"mailto:{inv.get('email','')}?subject=Invoice%20{inv['note']}&body={msg}"
+            st.write(f"• **{inv['student']}** — [WhatsApp]({wa}) | [Email]({mailto})")
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, "invoices.csv", "text/csv")
+    else:
+        st.info("No invoices yet.")
 
 def page_settings():
-    st.markdown("### ⚙️ Settings")
-    st.write("**Suites**")
-    with st.form("suite_form"):
-        new_suite = st.text_input("Add new suite")
-        if st.form_submit_button("Add Suite"):
-            if new_suite and new_suite not in st.session_state["suites"]:
-                st.session_state["suites"].append(new_suite)
-                st.success(f"Added suite: {new_suite}")
-    st.write("Current suites:", ", ".join(st.session_state["suites"]) or "—")
+    st.subheader("⚙️ Settings")
+    st.write("Manage users, suites, and view demo accounts.")
 
-    st.divider()
-    st.write("**Demo Users**")
-    st.json(USERS)
+    st.markdown("**Demo users (from `users.json`)**")
+    st.json(users)
 
-    st.info("To configure real users or email, set Streamlit **Secrets** in the Cloud dashboard.")
+    with st.expander("➕ Add / Update user"):
+        u = st.text_input("Username", key="set_u")
+        nm = st.text_input("Name", key="set_nm")
+        em = st.text_input("Email", key="set_em")
+        rl = st.selectbox("Role", ["admin","manager","student"], key="set_rl")
+        pw = st.text_input("Password (will be hashed)", type="password", key="set_pw")
+        if st.button("Save user"):
+            if not u:
+                st.error("Username required.")
+            else:
+                users[u] = {
+                    "name": nm or u,
+                    "email": em,
+                    "role": rl,
+                    "password_hash": password_hash(pw or random_temp_pass())
+                }
+                save_json(USERS_FILE, users)
+                st.success("User saved.")
 
-# ------------------------------
-# Main
-# ------------------------------
-if not st.session_state["auth"]["logged_in"]:
-    login_ui()
-else:
-    colA, colB = st.columns([3,1])
-    with colA:
-        st.markdown("## 🏠 Gradspace Student Accommodation Tracker")
-    with colB:
-        topbar()
-    with st.sidebar:
-        st.markdown("## 📋 Menu")
-        page = st.radio("Go to", ["Students", "Maintenance", "Staff", "Invoices", "Settings"], label_visibility="collapsed")
-    if page == "Students":
+    st.markdown("### Email (SMTP)")
+    st.write("Configure in Streamlit Secrets → `email` section:")
+    st.code(
+        """[email]
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = "587"
+EMAIL_USER = "you@example.com"
+EMAIL_PASS = "your-app-password"
+""")
+
+def student_portal():
+    st.subheader("🎓 My Account")
+    me = st.session_state.get("user")
+    my_rec = next((s for s in students if s.get("name")==users[me].get("name")), None)
+    st.write("Welcome,", users[me].get("name"))
+    if my_rec:
+        st.json(my_rec)
+    else:
+        st.info("No student record linked to your name yet.")
+
+# ---------- Routing by role ----------
+def main_app():
+    role = st.session_state.get("role", "student")
+    if role == "student":
+        tabs = ["My Account"]
+    elif role == "manager":
+        tabs = ["Students","Maintenance","Invoices","Staff"]
+    else:  # admin
+        tabs = ["Students","Maintenance","Invoices","Staff","Settings"]
+
+    choice = st.sidebar.radio("Navigate", tabs, key="nav")
+    if choice == "Students":
         page_students()
-    elif page == "Maintenance":
+    elif choice == "Maintenance":
         page_maintenance()
-    elif page == "Staff":
+    elif choice == "Staff":
         page_staff()
-    elif page == "Invoices":
+    elif choice == "Invoices":
         page_invoices()
-    elif page == "Settings":
+    elif choice == "Settings":
         page_settings()
+    else:
+        student_portal()
+
+# ---------- Entry ----------
+if not st.session_state.get("auth"):
+    show_login()
+else:
+    main_app()
