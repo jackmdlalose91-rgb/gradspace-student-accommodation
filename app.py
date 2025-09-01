@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 from datetime import date
@@ -13,7 +14,13 @@ st.subheader("➕ Add Student Record")
 with st.form("add_student"):
     name = st.text_input("Student Name")
     suite = st.selectbox("Suite", ["Gradspace Suite 1", "Gradspace Suite 2"])
-    room = st.selectbox("Room Number", ["Room 1", "Room 2", "Room 3", "Room 4"])
+
+    # Dynamic room numbers depending on suite
+    if suite == "Gradspace Suite 1":
+        room = st.selectbox("Room Number", ["Room 1", "Room 2", "Room 3", "Room 4"])
+    else:
+        room = st.selectbox("Room Number", ["Room 5", "Room 6", "Room 7", "Room 8"])
+
     entry_date = st.date_input("Entry Date", value=date.today())
     exit_date = st.date_input("Exit Date", value=date.today())
     rent = st.number_input("Monthly Rent", min_value=0, step=50)
