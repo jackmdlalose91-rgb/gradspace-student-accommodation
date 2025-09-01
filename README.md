@@ -1,31 +1,31 @@
-# Gradspace Student Accommodation (Streamlit)
+# Gradspace (Supabase + Cron Reminders)
 
-This package includes:
-- Multi-role login (admin / manager / student) with **bcrypt** hashed passwords stored in `users.json`.
-- **Forgot Password** with email reset code (uses SMTP from Streamlit Secrets).
-- Students, Maintenance, Staff, Invoices pages with CSV export and photo uploads.
-- PWA assets so users can "Install App" on mobile/desktop (`.streamlit/public/` files).
+- Auth with first-login password change
+- Student face page (profile, bills, payments, comments)
+- Admin/Manager dashboards
+- Settings with branding, billing defaults, notification toggles
+- **Background reminders** via GitHub Actions running `cron_worker.py`
+- PWA support (`.streamlit/public/*`)
 
-## Deploy on Streamlit Cloud
-- Repo: `jackmdlalose91-rgb/gradspace-student-accommodation`
-- Branch: `main`
-- Main file path: `app.py`
+## Secrets (Streamlit & GitHub Actions)
+Add to Streamlit **Secrets** and GitHub repo **Actions secrets**:
 
-## Configure Secrets (Settings → Secrets)
-```
-[users]  # (optional) not used in this version; users are in users.json
-# admin = "YOURPASS|admin|Your Admin Name"
+```toml
+[supabase]
+url = "https://YOURPROJECT.supabase.co"
+anon_key = "YOUR_SUPABASE_ANON_KEY"
 
 [email]
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = "587"
 EMAIL_USER = "you@example.com"
 EMAIL_PASS = "your-app-password"
+
+[app]
+currency = "ZAR"
+from_name = "Gradspace Team"
 ```
 
-## Default logins
-- admin / admin123 (role: admin)
-- manager / manager123 (role: manager)
-- student / student123 (role: student)
-
-Change or add users in the app via **Settings → Add/Update user** or directly edit `users.json` (hashes are automatic when using the UI).
+## Cron Reminders
+- The workflow `.github/workflows/cron.yml` runs `cron_worker.py` daily.
+- It marks invoices overdue and emails students (and CC managers if enabled).
