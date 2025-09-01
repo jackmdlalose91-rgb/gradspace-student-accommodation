@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 from datetime import date
@@ -14,13 +13,10 @@ st.subheader("➕ Add Student Record")
 with st.form("add_student"):
     name = st.text_input("Student Name")
     suite = st.selectbox("Suite", ["Gradspace Suite 1", "Gradspace Suite 2"])
-
-    # Dynamic room numbers depending on suite
     if suite == "Gradspace Suite 1":
         room = st.selectbox("Room Number", ["Room 1", "Room 2", "Room 3", "Room 4"])
     else:
-        room = st.selectbox("Room Number", ["Room 5", "Room 6", "Room 7", "Room 8"])
-
+        room = st.selectbox("Room Number", ["Room A", "Room B", "Room C", "Room D", "Room E"])
     entry_date = st.date_input("Entry Date", value=date.today())
     exit_date = st.date_input("Exit Date", value=date.today())
     rent = st.number_input("Monthly Rent", min_value=0, step=50)
@@ -57,16 +53,14 @@ st.subheader("📋 Student Records")
 if st.session_state["students"]:
     df = pd.DataFrame(st.session_state["students"])
 
-    # Highlight overdue (unpaid) vs paid
     def highlight_due(row):
         if row["Rent Paid"] == "No":
-            return ["background-color: #ffcccc"] * len(row)  # light red
+            return ["background-color: #ffcccc"] * len(row)
         else:
-            return ["background-color: #ccffcc"] * len(row)  # light green
+            return ["background-color: #ccffcc"] * len(row)
 
     st.dataframe(df.style.apply(highlight_due, axis=1))
 
-    # Download option
     csv = df.to_csv(index=False).encode('utf-8')
     st.download_button("⬇️ Download CSV", csv, "student_records.csv", "text/csv")
 else:
