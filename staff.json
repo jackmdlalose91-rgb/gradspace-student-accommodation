@@ -1,8 +1,1 @@
-[
-  {
-    "name": "Manager",
-    "role": "manager",
-    "phone": "",
-    "email": "manager@example.com"
-  }
-]
+[{"id": "st1", "name": "Jane Smith", "role": "warden"}]
